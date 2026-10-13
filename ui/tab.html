@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8">
+  <title>Розсилка великих файлів</title>
+  <link rel="stylesheet" href="tab.css">
+</head>
+<body>
+  <h1>Розсилка великих файлів</h1>
+
+  <div class="grid">
+    <!-- 1. ФАЙЛ -->
+    <section>
+      <h2>1. Файл і розбиття</h2>
+      <div class="row">
+        <input type="file" id="fileInput">
+      </div>
+      <div class="row">
+        <label>Макс. розмір вкладення, МБ
+          <input type="text" id="maxSize" value="10" size="6" inputmode="decimal">
+        </label>
+      </div>
+      <p class="hint">Вкладення кодуються в base64 (≈ +37% до розміру), тому ліміт
+        ставте з запасом відносно ліміту сервера.</p>
+      <div id="partsSummary" class="hint"></div>
+      <ul id="partsList" class="parts"></ul>
+    </section>
+
+    <!-- 2. ЛИСТ -->
+    <section>
+      <h2>2. Лист</h2>
+      <div class="row"><label>Від кого
+        <select id="identity"></select></label></div>
+      <div class="row"><label>Тема
+        <input type="text" id="subject" placeholder="Тема листа"></label></div>
+      <div class="row"><label>Текст
+        <textarea id="body" rows="5"></textarea></label></div>
+      <div class="row"><label>Адресатів вказувати в полі
+        <select id="fieldType">
+          <option value="bcc" selected>Прихована копія (Bcc)</option>
+          <option value="to">Кому (To)</option>
+          <option value="cc">Копія (Cc)</option>
+        </select></label></div>
+      <div class="row"><label>Пауза між листами, с
+        <input type="text" id="delay" value="2" size="4" inputmode="decimal"></label></div>
+    </section>
+
+    <!-- 3. АДРЕСАТИ -->
+    <section class="wide">
+      <h2>3. Адресати</h2>
+      <div class="cols">
+        <div>
+          <label>Імена (по одному в рядок)
+            <textarea id="recipientsInput" rows="8" placeholder="Іваненко Іван&#10;Петренко Петро"></textarea>
+          </label>
+          <div class="row">
+            <button id="parseBtn">Розібрати та знайти</button>
+            <button id="clearBtn" class="secondary">Очистити все</button>
+            <button id="reloadBtn" class="secondary" title="Перечитати адресні книги">Оновити книгу</button>
+          </div>
+          <div id="contactsInfo" class="hint"></div>
+        </div>
+        <div>
+          <h3>Додати вручну з адресної книги</h3>
+          <input type="text" id="manualSearch" placeholder="Почніть вводити ім'я або email">
+          <ul id="manualResults" class="results"></ul>
+        </div>
+      </div>
+
+      <h3>Знайдені адресати (<span id="foundCount">0</span>)</h3>
+      <div class="tablewrap">
+        <table id="foundTable">
+          <thead><tr><th>#</th><th>Запит</th><th>Контакт / Email</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+
+      <h3 class="warn">Не знайдені (<span id="nfCount">0</span>)</h3>
+      <ul id="notFound" class="nf"></ul>
+    </section>
+
+    <!-- 4. ВІДПРАВКА -->
+    <section class="wide">
+      <h2>4. Відправка</h2>
+      <div class="row">
+        <button id="sendBtn" class="primary">Відправити</button>
+        <button id="cancelBtn" class="secondary" disabled>Зупинити</button>
+        <span id="progress"></span>
+      </div>
+      <p class="hint">Повторне натискання відправляє лише ті частини, що ще не мають статусу ✅.</p>
+    </section>
+
+    <!-- 5. ЛОГИ -->
+    <section class="wide">
+      <h2>Журнал</h2>
+      <div id="log" class="log"></div>
+      <button id="clearLog" class="secondary">Очистити журнал</button>
+    </section>
+  </div>
+
+  <script src="tab.js"></script>
+</body>
+</html>
