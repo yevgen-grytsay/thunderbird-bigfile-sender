@@ -62,21 +62,16 @@
         </div>
         <div>
           <h3>Додати вручну з адресної книги</h3>
+          <div id="pendingInfo" class="pending" hidden></div>
           <input type="text" id="manualSearch" placeholder="Почніть вводити ім'я або email">
           <ul id="manualResults" class="results"></ul>
         </div>
       </div>
 
-      <h3>Знайдені адресати (<span id="foundCount">0</span>)</h3>
-      <div class="tablewrap">
-        <table id="foundTable">
-          <thead><tr><th>#</th><th>Запит</th><th>Контакт / Email</th><th></th></tr></thead>
-          <tbody></tbody>
-        </table>
-      </div>
-
-      <h3 class="warn">Не знайдені (<span id="nfCount">0</span>)</h3>
-      <ul id="notFound" class="nf"></ul>
+      <div id="recStats" class="stats"></div>
+      <div id="secRecognized" class="recsec"></div>
+      <div id="secUnrecognized" class="recsec"></div>
+      <div id="secIgnored" class="recsec"></div>
     </section>
 
     <!-- 4. ВІДПРАВКА -->
@@ -86,8 +81,9 @@
         <button id="sendBtn" class="primary">Відправити</button>
         <button id="cancelBtn" class="secondary" disabled>Зупинити</button>
         <span id="progress"></span>
+        <span id="sendBlock" class="blocked"></span>
       </div>
-      <p class="hint">Повторне натискання відправляє лише ті частини, що ще не мають статусу ✅.</p>
+      <p class="hint">Повторне натискання «Відправити» відправляє лише ті частини, що ще не мають статусу ✅.</p>
     </section>
 
     <!-- 5. ЛОГИ -->
@@ -98,6 +94,6 @@
     </section>
   </div>
 
-  <script src="tab.js"></script>
+  <script type="module" src="tab.js"></script>
 </body>
 </html>

@@ -1,18 +1,23 @@
-"use strict";
+import { RecipientList, normalizeName } from "./recipients.js";
 
 const $ = (id) => document.getElementById(id);
+
+const list = new RecipientList();   // вся логіка розпізнавання — у recipients.js
+const selected = new Set();         // id адресатів, вибраних чекбоксами
 
 const state = {
   file: null,
   parts: [],          // {name, start, end, size, enabled, status, error}
   contacts: [],       // [{id, name, first, last, email, book}]
-  index: new Map(),   // normalized name -> contacts[]
-  recipients: [],     // {query, candidates:[contact], chosen:number}
-  notFound: [],       // string[]
-  pendingNF: null,    // ім'я з "не знайдених", для якого шукаємо вручну
+  pendingId: null,    // нерозпізнаний адресат, для якого шукаємо контакт вручну
   sending: false,
   cancel: false,
+  queued: false,      // чекає черги: інша вкладка зараз відправляє
+  abort: null,        // AbortController для скасування очікування черги
 };
+
+const LOCK_NAME = "bigfile-sender:send";
+const openedAt = new Date().toLocaleTimeString("uk-UA", { hour: "2-digit", minute: "2-digit" });
 
 /* ---------- утиліти ---------- */
 
@@ -47,20 +52,6 @@ function fmtSize(n) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const num = (s) => parseFloat(String(s).replace(",", "."));
-
-// Нормалізація імен: регістр, апострофи, латино-кириличні омогліфи
-const HOMO = { a: "а", c: "с", e: "е", i: "і", o: "о", p: "р", x: "х", y: "у",
-               k: "к", m: "м", t: "т", b: "в", h: "н" };
-function norm(s) {
-  return (s || "")
-    .normalize("NFKC")
-    .toLowerCase()
-    .replace(/[’ʼ`´‘]/g, "'")
-    .replace(/ё/g, "е")
-    .replace(/\s+/g, " ")
-    .trim()
-    .replace(/[a-z]/g, (ch) => HOMO[ch] || ch);
-}
 
 /* ---------- 1. Файл і розбиття ---------- */
 
@@ -134,7 +125,23 @@ function renderParts() {
 function updateProgress() {
   const active = state.parts.filter((p) => p.enabled);
   const ok = active.filter((p) => p.status === "ok").length;
-  $("progress").textContent = active.length ? `Надіслано ${ok} з ${active.length}` : "";
+  $("progress").textContent =
+    (active.length ? `Надіслано ${ok} з ${active.length}` : "") +
+    (state.queued ? " · у черзі: інша вкладка відправляє" : "");
+  updateTitle();
+}
+
+// Заголовок вкладки показує стан, щоб вкладки можна було розрізняти
+function updateTitle() {
+  const active = state.parts.filter((p) => p.enabled);
+  const ok = active.filter((p) => p.status === "ok").length;
+  let mark = "";
+  if (state.queued) mark = "⏳ черга · ";
+  else if (state.sending) mark = `⏳ ${ok}/${active.length} · `;
+  else if (active.length && ok === active.length) mark = "✅ ";
+  else if (active.some((p) => p.status === "fail")) mark = "⚠ ";
+  const subj = $("subject").value.trim();
+  document.title = `${mark}Розсилка ${openedAt}${subj ? " · " + subj.slice(0, 40) : ""}`;
 }
 
 /* ---------- 2. Відправники ---------- */
@@ -152,9 +159,6 @@ async function loadIdentities() {
     }
   }
 }
-
-/* ---------- 3. Адресна книга і адресати ---------- */
-
 
 function propGet(p, key) {
   if (!p) return "";
@@ -207,175 +211,339 @@ function contactInfo(c) {
   return { name, first, last, email };
 }
 
+/* ---------- 3. Адресна книга і адресати ---------- */
+
 async function loadContacts() {
   const books = await messenger.addressBooks.list();
   const all = [];
   for (const b of books) {
-    let list = [];
-    try { list = await messenger.addressBooks.contacts.list(b.id); }
+    let items = [];
+    try { items = await messenger.addressBooks.contacts.list(b.id); }
     catch (e) { log(`Не вдалося прочитати книгу «${b.name}»: ${e.message}`, "warn"); }
-    for (const c of list) {
-      const info = contactInfo(c);
-      all.push({ id: c.id, ...info, book: b.name });
-    }
+    for (const c of items) all.push({ id: c.id, ...contactInfo(c), book: b.name });
   }
   state.contacts = all;
-  buildIndex();
+  list.setContacts(all);
   $("contactsInfo").textContent = `У книгах (${books.length}): ${all.length} контактів.`;
   log(`Завантажено ${all.length} контактів з ${books.length} адресних книг.`);
-}
-
-function buildIndex() {
-  const idx = new Map();
-  const add = (key, c) => {
-    const k = norm(key);
-    if (!k) return;
-    let a = idx.get(k);
-    if (!a) idx.set(k, (a = []));
-    if (!a.includes(c)) a.push(c);
-  };
-  for (const c of state.contacts) {
-    add(c.name, c);
-    if (c.first || c.last) {
-      add(`${c.first} ${c.last}`, c);
-      add(`${c.last} ${c.first}`, c);
-    }
-  }
-  state.index = idx;
-}
-
-function parseRecipients() {
-  const lines = $("recipientsInput").value
-    .split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
-  if (!lines.length) { log("Список імен порожній.", "warn"); return; }
-
-  state.notFound = [];
-  let added = 0, skipped = 0;
-  for (const line of lines) {
-    const cands = state.index.get(norm(line));
-    if (!cands) {
-      if (!state.notFound.includes(line)) state.notFound.push(line);
-      continue;
-    }
-    if (state.recipients.some((r) => r.query === line)) { skipped++; continue; }
-    const sorted = cands.slice().sort((a, b) => !!b.email - !!a.email);
-    state.recipients.push({ query: line, candidates: sorted, chosen: 0 });
-    added++;
-  }
-  log(`Розібрано рядків: ${lines.length}. Додано: ${added}, вже були в списку: ${skipped}, ` +
-      `не знайдено: ${state.notFound.length}.`,
-      state.notFound.length ? "warn" : "ok");
-  for (const n of state.notFound) log(`Не знайдено в адресній книзі: «${n}»`, "warn");
   renderRecipients();
 }
 
-function renderRecipients() {
-  const tbody = $("foundTable").querySelector("tbody");
-  tbody.replaceChildren();
-  const seenEmails = new Set();
+const contactText = (c) => `${c.name} <${c.email || "немає email"}>`;
 
-  state.recipients.forEach((r, i) => {
-    const c = r.candidates[r.chosen];
-    const emailKey = (c.email || "").toLowerCase();
-    const dup = c.email && seenEmails.has(emailKey);
-    if (c.email) seenEmails.add(emailKey);
-
-    let contactCell;
-    if (r.candidates.length > 1) {
-      const sel = el("select", { onchange: (e) => { r.chosen = +e.target.value; renderRecipients(); } });
-      r.candidates.forEach((cc, k) => sel.appendChild(el("option", {
-        value: k, selected: k === r.chosen,
-        text: `${cc.name} <${cc.email || "немає email"}> (${cc.book})`,
-      })));
-      contactCell = el("td", {}, sel);
-    } else {
-      contactCell = el("td", { text: `${c.name} <${c.email || "немає email"}>` });
-    }
-
-    const tr = el("tr", { class: !c.email ? "noemail" : dup ? "dup" : "" },
-      el("td", { text: i + 1 }),
-      el("td", { text: r.query }),
-      contactCell,
-      el("td", {}, el("button", { class: "secondary", text: "✕", title: "Видалити зі списку",
-        onclick: () => { state.recipients.splice(i, 1); renderRecipients(); } })));
-    if (dup) tr.title = "Дублікат email — буде надіслано лише один раз";
-    if (!c.email) tr.title = "У контакта немає email — буде пропущено";
-    tbody.appendChild(tr);
-  });
-
-  $("foundCount").textContent = state.recipients.length;
-
-  const ul = $("notFound");
-  ul.replaceChildren();
-  state.notFound.forEach((n, i) => {
-    ul.appendChild(el("li", {},
-      el("span", { class: "n", text: n }),
-      el("button", { class: "secondary", text: "Знайти вручну", onclick: () => {
-        state.pendingNF = n;
-        const s = $("manualSearch");
-        s.value = n;
-        s.focus();
-        runManualSearch();
-      } }),
-      el("button", { class: "secondary", text: "✕", title: "Прибрати з переліку",
-        onclick: () => { state.notFound.splice(i, 1); renderRecipients(); } })));
-  });
-  $("nfCount").textContent = state.notFound.length;
+function namesOf(ids) {
+  const names = ids.map((id) => { const r = list.get(id); return r ? `«${r.query}»` : ""; }).filter(Boolean);
+  return names.length > 10 ? names.slice(0, 10).join(", ") + ` … (+${names.length - 10})` : names.join(", ");
 }
 
+function reasonText(row) {
+  switch (row.reason) {
+    case "not_found": return "не знайдено в адресній книзі";
+    case "no_email":  return `контакт «${row.contact.name}» не має email`;
+    case "ambiguous": return `кілька збігів: ${row.candidates.length}`;
+    default: return "";
+  }
+}
+
+function orderText(row) {
+  if (!row.ordinals.length) return "додано вручну";
+  return row.ordinals.join(", ") + (row.ordinals.length > 1 ? `  (×${row.ordinals.length})` : "");
+}
+
+function briefText(b) {
+  return `«${b.query}»` + (b.ordinals.length ? ` (№ ${b.ordinals.join(", ")})` : " (додано вручну)");
+}
+
+function noteNodes(row) {
+  return row.notes.map((n) => el("div", {
+    class: n.type === "same_contact" ? "note-warn" : "note-info",
+    text: (n.type === "same_contact" ? "⚠ Той самий контакт, що й " : "ℹ Спільний email з ") +
+          n.with.map(briefText).join("; "),
+  }));
+}
+
+/* ----- розбір тексту ----- */
+
+function parseRecipients() {
+  const n = list.parse($("recipientsInput").value);
+  if (!n) { log("Список імен порожній.", "warn"); return; }
+  if (!state.contacts.length) log("Адресну книгу не завантажено або вона порожня.", "warn");
+
+  selected.clear();
+  state.pendingId = null;
+
+  const v = list.view();
+  const s = v.stats;
+  log(`Розібрано рядків: ${s.totalLines}; унікальних: ${s.uniqueInText}; повторів: ${s.duplicatesInText}. ` +
+      `Розпізнано: ${s.recognized}, не розпізнано: ${s.unrecognized}, ігноровано: ${s.ignored}.`,
+      s.unrecognized ? "warn" : "ok");
+
+  for (const r of [...v.recognized, ...v.unrecognized, ...v.ignored]) {
+    if (r.ordinals.length > 1) log(`Повтор: «${r.query}» — рядки № ${r.ordinals.join(", ")}.`, "warn");
+  }
+  for (const r of v.unrecognized) {
+    log(`Не розпізнано (№ ${r.ordinals.join(", ") || "—"}): «${r.query}» — ${reasonText(r)}.`, "warn");
+  }
+  renderRecipients();
+}
+
+/* ----- групові операції ----- */
+
+function ignoreSelected(ids) {
+  if (!ids.length || state.sending) return;
+  const n = list.ignore(ids);
+  log(`Проігноровано адресатів: ${n}. ${namesOf(ids)}`);
+  ids.forEach((id) => selected.delete(id));
+  renderRecipients();
+}
+
+function activateSelected(ids) {
+  if (!ids.length || state.sending) return;
+  const n = list.activate(ids);
+  log(`Активовано адресатів: ${n}. ${namesOf(ids)}`);
+  ids.forEach((id) => selected.delete(id));
+  renderRecipients();
+}
+
+/* ----- ручний вибір з адресної книги ----- */
+
 function runManualSearch() {
-  const q = norm($("manualSearch").value);
+  const q = normalizeName($("manualSearch").value);
   const ul = $("manualResults");
   ul.replaceChildren();
   if (q.length < 2) return;
+  const inUse = list.contactIdsInUse();
   const hits = state.contacts
-    .filter((c) => norm(c.name).includes(q) || (c.email || "").toLowerCase().includes(q))
+    .filter((c) => normalizeName(c.name).includes(q) || (c.email || "").toLowerCase().includes(q))
     .slice(0, 30);
   for (const c of hits) {
     ul.appendChild(el("li", {
-      text: `${c.name} <${c.email || "немає email"}> — ${c.book}`,
-      onclick: () => addManual(c),
+      text: `${contactText(c)} — ${c.book}${inUse.has(c.id) ? "  ✓ у списку" : ""}`,
+      onclick: () => addFromBook(c),
     }));
   }
   if (!hits.length) ul.appendChild(el("li", { text: "Нічого не знайдено" }));
 }
 
-function addManual(c) {
-  if (state.recipients.some((r) => r.candidates[r.chosen].id === c.id)) {
-    log(`«${c.name}» вже є в списку.`, "warn");
-    return;
+function addFromBook(c) {
+  if (state.sending) return;
+  if (state.pendingId != null) {
+    const target = list.get(state.pendingId);
+    const res = list.resolveManually(state.pendingId, c);
+    log(`Для «${target ? target.query : "?"}» вибрано контакт ${contactText(c)}.`, c.email ? "ok" : "warn");
+    if (res.duplicateOf) {
+      log(`Увага: цей контакт уже є серед адресатів — «${res.duplicateOf.query}».`, "warn");
+    }
+    selected.delete(state.pendingId);
+    state.pendingId = null;
+  } else {
+    const res = list.addManual(c);
+    if (res.added) log(`Додано вручну: ${contactText(c)}.`, c.email ? "info" : "warn");
+    else log(`«${c.name}» уже є в списку (${res.existing.ignored ? "серед ігнорованих" : "«" + res.existing.query + "»"}).`, "warn");
   }
-  state.recipients.push({ query: c.name, candidates: [c], chosen: 0 });
-  log(`Додано вручну: ${c.name} <${c.email || "немає email"}>`);
-  if (state.pendingNF) {
-    state.notFound = state.notFound.filter((n) => n !== state.pendingNF);
-    state.pendingNF = null;
-  }
+  $("manualSearch").value = "";
+  runManualSearch();
   renderRecipients();
 }
 
-function collectRecipients() {
-  const out = [];
-  const seen = new Set();
-  for (const r of state.recipients) {
-    const c = r.candidates[r.chosen];
-    if (!c.email) { log(`Пропущено «${c.name}»: немає email.`, "warn"); continue; }
-    const key = c.email.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(`"${c.name.replace(/["\\]/g, "")}" <${c.email}>`);
+function renderPending() {
+  const box = $("pendingInfo");
+  const r = state.pendingId != null ? list.get(state.pendingId) : null;
+  if (!r) { box.hidden = true; box.replaceChildren(); return; }
+  box.hidden = false;
+  box.replaceChildren(
+    el("span", { text: `Оберіть контакт для «${r.query}»` }),
+    el("button", { class: "secondary", text: "Скасувати",
+      onclick: () => { state.pendingId = null; renderRecipients(); } }));
+}
+
+/* ----- відображення секцій ----- */
+
+function renderStats(s) {
+  const box = $("recStats");
+  box.replaceChildren();
+  const add = (label, value, cls = "") =>
+    box.append(el("span", { class: "stat " + cls }, `${label}: `, el("b", { text: String(value) })));
+  add("Вставлено рядків", s.totalLines);
+  add("з них повторів", s.duplicatesInText, s.duplicatesInText ? "warn" : "");
+  add("Розпізнано", s.recognized, "ok");
+  add("Не розпізнано", s.unrecognized, s.unrecognized ? "err" : "");
+  add("Ігноровано", s.ignored);
+  if (s.manualAdded) add("Додано вручну", s.manualAdded);
+}
+
+function renderSection(container, cfg) {
+  const oldWrap = container.querySelector(".tablewrap");
+  const scrollTop = oldWrap ? oldWrap.scrollTop : 0;
+  container.replaceChildren();
+
+  const ids = cfg.rows.map((r) => r.id);
+  const picked = ids.filter((id) => selected.has(id));
+  const all = ids.length > 0 && picked.length === ids.length;
+
+  container.append(el("div", { class: "sec-head" },
+    el("h3", { class: cfg.cls, text: `${cfg.title} (${cfg.rows.length})` }),
+    el("button", {
+      class: "secondary",
+      text: cfg.actionLabel + (picked.length ? ` (${picked.length})` : ""),
+      disabled: picked.length === 0 || state.sending,
+      onclick: () => cfg.action(picked),
+    })));
+
+  if (!cfg.rows.length) {
+    container.append(el("div", { class: "empty", text: cfg.empty }));
+    return;
   }
-  return out;
+
+  // чекбокс секції з трьома станами: нічого / частково / усі
+  const master = el("input", {
+    type: "checkbox",
+    title: "Вибрати всіх / скинути вибір",
+    checked: all,
+    indeterminate: picked.length > 0 && !all,
+    disabled: state.sending,
+    onclick: () => {
+      if (all) ids.forEach((id) => selected.delete(id));
+      else ids.forEach((id) => selected.add(id));
+      renderRecipients();
+    },
+  });
+
+  const thead = el("thead", {}, el("tr", {},
+    el("th", { class: "chk" }, master),
+    ...cfg.columns.map((c) => el("th", { text: c.title }))));
+
+  const tbody = el("tbody");
+  for (const row of cfg.rows) {
+    const cb = el("input", {
+      type: "checkbox",
+      checked: selected.has(row.id),
+      disabled: state.sending,
+      onchange: (e) => {
+        if (e.target.checked) selected.add(row.id); else selected.delete(row.id);
+        renderRecipients();
+      },
+    });
+    const tr = el("tr", { class: row.id === state.pendingId ? "pending-row" : "" },
+      el("td", { class: "chk" }, cb));
+    for (const col of cfg.columns) {
+      const td = el("td");
+      const v = col.cell(row);
+      if (v != null) td.append(...(Array.isArray(v) ? v : [v]));
+      tr.append(td);
+    }
+    tbody.append(tr);
+  }
+
+  const wrap = el("div", { class: "tablewrap" }, el("table", {}, thead, tbody));
+  container.append(wrap);
+  wrap.scrollTop = scrollTop;
+}
+
+function renderRecipients() {
+  const v = list.view();
+
+  const present = new Set([...v.recognized, ...v.unrecognized, ...v.ignored].map((r) => r.id));
+  for (const id of [...selected]) if (!present.has(id)) selected.delete(id);
+  if (state.pendingId != null && !v.unrecognized.some((r) => r.id === state.pendingId)) state.pendingId = null;
+
+  renderStats(v.stats);
+  renderPending();
+
+  renderSection($("secRecognized"), {
+    title: "Розпізнані", cls: "sec-ok", rows: v.recognized,
+    actionLabel: "Ігнорувати вибраних", action: ignoreSelected,
+    empty: "Немає розпізнаних адресатів.",
+    columns: [
+      { title: "№ у списку", cell: (r) => orderText(r) },
+      { title: "Запит", cell: (r) => r.query },
+      { title: "Контакт", cell: (r) => contactText(r.contact) },
+      { title: "Примітки", cell: (r) => noteNodes(r) },
+    ],
+  });
+
+  renderSection($("secUnrecognized"), {
+    title: "Не розпізнані", cls: "sec-err", rows: v.unrecognized,
+    actionLabel: "Ігнорувати вибраних", action: ignoreSelected,
+    empty: "Усіх адресатів розпізнано.",
+    columns: [
+      { title: "№ у списку", cell: (r) => orderText(r) },
+      { title: "Запит", cell: (r) => r.query },
+      {
+        title: "Проблема / вибір",
+        cell: (r) => {
+          if (r.reason !== "ambiguous") return reasonText(r);
+          const sel = el("select", {
+            disabled: state.sending,
+            onchange: (e) => {
+              if (e.target.value === "") return;
+              list.setChoice(r.id, +e.target.value);
+              selected.delete(r.id);
+              renderRecipients();
+            },
+          }, el("option", { value: "", text: "— оберіть контакт —", selected: r.chosen == null }));
+          r.candidates.forEach((c, k) =>
+            sel.append(el("option", { value: String(k), text: `${contactText(c)} (${c.book})` })));
+          return sel;
+        },
+      },
+      {
+        title: "Дія",
+        cell: (r) => el("button", {
+          class: "secondary", text: "Знайти вручну", disabled: state.sending,
+          onclick: () => {
+            state.pendingId = r.id;
+            const s = $("manualSearch");
+            s.value = r.query;
+            s.focus();
+            runManualSearch();
+            renderRecipients();
+          },
+        }),
+      },
+    ],
+  });
+
+  renderSection($("secIgnored"), {
+    title: "Ігноровані", cls: "sec-muted", rows: v.ignored,
+    actionLabel: "Активувати вибраних", action: activateSelected,
+    empty: "Немає ігнорованих адресатів.",
+    columns: [
+      { title: "№ у списку", cell: (r) => orderText(r) },
+      { title: "Запит", cell: (r) => r.query },
+      {
+        title: "Стан до ігнорування",
+        cell: (r) => r.status === "recognized"
+          ? `розпізнано: ${contactText(r.contact)}`
+          : `не розпізнано: ${reasonText(r)}`,
+      },
+    ],
+  });
+
+  updateSendState();
+}
+
+function updateSendState() {
+  const gate = list.canSend();
+  $("sendBtn").disabled = state.sending || !gate.ok;
+  $("sendBlock").textContent = gate.ok ? "" : "⛔ " + gate.reason;
+}
+
+function collectRecipients() {
+  const entries = list.recipientsForSending();
+  const total = entries.reduce((n, e) => n + e.recipientIds.length, 0);
+  log(`Адресатів: ${total}; унікальних email у листі: ${entries.length}.`);
+  return entries.map((e) => `"${e.name.replace(/["\\]/g, "")}" <${e.email}>`);
 }
 
 /* ---------- 4. Відправка ---------- */
 
 function setSending(v) {
   state.sending = v;
-  $("sendBtn").disabled = v;
   $("cancelBtn").disabled = !v;
-  for (const id of ["fileInput", "maxSize", "parseBtn", "clearBtn", "reloadBtn"]) $(id).disabled = v;
+  for (const id of ["fileInput", "maxSize", "parseBtn", "clearBtn", "reloadBtn", "manualSearch"]) $(id).disabled = v;
   renderParts();
+  renderRecipients();
 }
 
 async function sendAll() {
@@ -385,6 +553,8 @@ async function sendAll() {
   if (!state.file || !state.parts.length) { alert("Спочатку виберіть файл."); return; }
   if (!todo.length) { alert("Немає частин для відправки."); return; }
 
+  const gate = list.canSend();
+  if (!gate.ok) { alert(gate.reason); return; }
   const recipients = collectRecipients();
   if (!recipients.length) { alert("Список адресатів порожній."); return; }
 
@@ -399,60 +569,101 @@ async function sendAll() {
   const total = state.parts.length;
   setSending(true);
   state.cancel = false;
-  log(`Початок відправки: частин ${todo.length}, адресатів ${recipients.length}.`);
+  state.abort = new AbortController();
+  try {
+    await withSendLock(async () => {
+      log(`Початок відправки: частин ${todo.length}, адресатів ${recipients.length}.`);
 
-  for (const part of todo) {
-    if (state.cancel) { log("Відправку зупинено користувачем.", "warn"); break; }
+      for (const part of todo) {
+        if (state.cancel) { log("Відправку зупинено користувачем.", "warn"); break; }
 
-    const index = state.parts.indexOf(part) + 1;
-    part.status = "sending";
-    part.error = "";
-    renderParts();
-    log(`Відправляється «${part.name}» (${fmtSize(part.size)})…`);
+        const index = state.parts.indexOf(part) + 1;
+        part.status = "sending";
+        part.error = "";
+        renderParts();
+        log(`Відправляється «${part.name}» (${fmtSize(part.size)})…`);
 
-    try {
-      const blob = state.file.slice(part.start, part.end);
-      const type = total === 1 ? (state.file.type || "application/octet-stream")
-                               : "application/octet-stream";
-      const att = new File([blob], part.name, { type });
+        try {
+          const blob = state.file.slice(part.start, part.end);
+          const type = total === 1 ? (state.file.type || "application/octet-stream")
+                                   : "application/octet-stream";
+          const att = new File([blob], part.name, { type });
 
-      const subject = total > 1 ? `${subjectBase} (частина ${index} з ${total})` : subjectBase;
-      let body = bodyBase;
-      if (total > 1) {
-        body += `${body ? "\n\n" : ""}Частина ${index} з ${total} файла «${state.file.name}». ` +
-                `Щоб зібрати файл, об'єднайте всі частини за порядком номерів.`;
+          const subject = total > 1 ? `${subjectBase} (частина ${index} з ${total})` : subjectBase;
+          let body = bodyBase;
+          if (total > 1) {
+            body += `${body ? "\n\n" : ""}Частина ${index} з ${total} файла «${state.file.name}». ` +
+                    `Щоб зібрати файл, об'єднайте всі частини за порядком номерів.`;
+          }
+
+          const details = {
+            identityId,
+            subject,
+            isPlainText: true,
+            plainTextBody: body,
+            attachments: [{ file: att, name: part.name }],
+          };
+          details[field] = recipients;
+
+          const tab = await messenger.compose.beginNew(details);
+          log(`Створено вікно листа (tab ${tab.id}) для «${part.name}».`);
+          try { await messenger.windows.update(tab.windowId, { state: "minimized" }); } catch (_) {}
+
+          const res = await messenger.compose.sendMessage(tab.id, { mode: "sendNow" });
+          try {
+            const msgs = (res && res.messages) || [];
+            log(`Відповідь Thunderbird: режим=${res && res.mode}, збережених копій=${msgs.length}` +
+                (msgs.length ? " [" + msgs.map((m) => `${m.folder ? m.folder.path : "?"} #${m.headerMessageId || m.id}`).join("; ") + "]" : ""));
+          } catch (_) {}
+
+          part.status = "ok";
+          log(`✔ «${part.name}» надіслано.`, "ok");
+        } catch (e) {
+          part.status = "fail";
+          part.error = e && e.message ? e.message : String(e);
+          log(`✘ «${part.name}»: ${part.error}`, "err");
+        }
+        renderParts();
+
+        if (delayMs && todo.indexOf(part) < todo.length - 1 && !state.cancel) await sleep(delayMs);
       }
 
-      const details = {
-        identityId,
-        subject,
-        isPlainText: true,
-        plainTextBody: body,
-        attachments: [{ file: att, name: part.name }],
-      };
-      details[field] = recipients;
-
-      const tab = await messenger.compose.beginNew(details);
-      try { await messenger.windows.update(tab.windowId, { state: "minimized" }); } catch (_) {}
-
-      await messenger.compose.sendMessage(tab.id, { mode: "sendNow" });
-
-      part.status = "ok";
-      log(`✔ «${part.name}» надіслано.`, "ok");
-    } catch (e) {
-      part.status = "fail";
-      part.error = e && e.message ? e.message : String(e);
-      log(`✘ «${part.name}»: ${part.error}`, "err");
-    }
-    renderParts();
-
-    if (delayMs && todo.indexOf(part) < todo.length - 1 && !state.cancel) await sleep(delayMs);
+      const failed = state.parts.filter((p) => p.enabled && p.status === "fail").length;
+      const okCount = state.parts.filter((p) => p.enabled && p.status === "ok").length;
+      log(`Завершено. Успішно: ${okCount}, з помилкою: ${failed}.`, failed ? "warn" : "ok");
+    });
+  } catch (e) {
+    if (e && e.name === "AbortError") log("Відправку скасовано під час очікування черги.", "warn");
+    else log(`Помилка відправки: ${e && e.message ? e.message : e}`, "err");
+  } finally {
+    state.queued = false;
+    state.abort = null;
+    setSending(false);
   }
+}
 
-  const failed = state.parts.filter((p) => p.enabled && p.status === "fail").length;
-  const okCount = state.parts.filter((p) => p.enabled && p.status === "ok").length;
-  log(`Завершено. Успішно: ${okCount}, з помилкою: ${failed}.`, failed ? "warn" : "ok");
-  setSending(false);
+// Одна відправка одночасно на всі вкладки розширення (Web Locks API):
+// SMTP-сервер і вікна листів не навантажуються паралельними розсилками.
+async function withSendLock(fn) {
+  if (!navigator.locks) return fn();
+
+  let ran = false;
+  await navigator.locks.request(LOCK_NAME, { ifAvailable: true }, async (lock) => {
+    if (!lock) return;
+    ran = true;
+    await fn();
+  });
+  if (ran) return;
+
+  state.queued = true;
+  log("Інша вкладка зараз відправляє листи — чекаю на чергу…", "warn");
+  updateProgress();
+  await navigator.locks.request(LOCK_NAME, { signal: state.abort.signal }, async () => {
+    state.queued = false;
+    updateProgress();
+    log("Черга дійшла, починаю відправку.");
+    await fn();
+  });
 }
 
 /* ---------- ініціалізація ---------- */
@@ -465,22 +676,38 @@ $("fileInput").addEventListener("change", (e) => {
 $("maxSize").addEventListener("change", buildParts);
 $("parseBtn").addEventListener("click", parseRecipients);
 $("clearBtn").addEventListener("click", () => {
-  state.recipients = []; state.notFound = []; state.pendingNF = null;
+  if (list.items.length && !confirm("Очистити весь список адресатів разом з ігнорованими?")) return;
+  list.clear();
+  selected.clear();
+  state.pendingId = null;
   $("recipientsInput").value = "";
+  log("Список адресатів очищено.");
   renderRecipients();
 });
-$("reloadBtn").addEventListener("click", async () => { await loadContacts(); });
-$("manualSearch").addEventListener("input", () => runManualSearch);
+$("reloadBtn").addEventListener("click", async () => {
+  try { await loadContacts(); } catch (e) { log("Помилка оновлення книги: " + e.message, "err"); }
+});
+$("manualSearch").addEventListener("input", runManualSearch);
 $("sendBtn").addEventListener("click", sendAll);
-$("cancelBtn").addEventListener("click", () => { state.cancel = true; $("cancelBtn").disabled = true; });
+$("cancelBtn").addEventListener("click", () => {
+  state.cancel = true;
+  if (state.abort) state.abort.abort();     // перериває лише очікування черги
+  $("cancelBtn").disabled = true;
+});
+$("subject").addEventListener("input", updateTitle);
+// Закриття вкладки під час відправки обірвало б розсилку
+window.addEventListener("beforeunload", (e) => {
+  if (state.sending) { e.preventDefault(); e.returnValue = ""; }
+});
 $("clearLog").addEventListener("click", () => $("log").replaceChildren());
 
 (async function init() {
+  updateTitle();
+  renderRecipients();
   try {
     await loadIdentities();
     await loadContacts();
   } catch (e) {
     log("Помилка ініціалізації: " + e.message, "err");
   }
-  renderRecipients();
 })();

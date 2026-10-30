@@ -40,3 +40,21 @@ td select { max-width: 100%; }
   font: 12px ui-monospace, Consolas, monospace; margin-bottom: 8px; white-space: pre-wrap; }
 .log-ok { color: #2f855a; } .log-err { color: #c53030; } .log-warn { color: #b7791f; }
 #progress { font-weight: 600; }
+
+.stats { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 14px 0 4px; padding: 8px 12px;
+  border: 1px solid var(--bd); border-radius: 6px; }
+.stat.ok b { color: #2f855a; } .stat.err b { color: #c53030; } .stat.warn b { color: #b7791f; }
+.recsec { margin: 8px 0; }
+.sec-head { display: flex; align-items: center; gap: 12px; }
+.sec-head h3 { margin: 8px 0 6px; flex: 1; }
+h3.sec-ok { color: #2f855a; } h3.sec-err { color: #c53030; } h3.sec-muted { color: #888; }
+.empty { color: #888; padding: 4px 0 8px; }
+.pending { display: flex; gap: 8px; align-items: center; background: #b7791f22; border: 1px solid #b7791f;
+  border-radius: 4px; padding: 4px 8px; margin: 6px 0; }
+.pending[hidden] { display: none; }
+.blocked { color: #c53030; font-weight: 600; }
+tr.pending-row td { background: #b7791f22; }
+th.chk, td.chk { width: 28px; }
+.note-warn { color: #b7791f; font-size: 12px; }
+.note-info { color: #888; font-size: 12px; }
+.muted { color: #888; }

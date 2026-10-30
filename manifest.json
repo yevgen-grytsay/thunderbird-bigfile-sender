@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Розсилка великих файлів",
   "description": "Розбиває великий архів на частини та розсилає їх списку адресатів з адресної книги окремими листами.",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "browser_specific_settings": {
     "gecko": {
       "id": "bigfile-sender@local.example",
